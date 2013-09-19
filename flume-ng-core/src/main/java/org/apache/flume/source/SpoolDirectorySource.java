@@ -24,9 +24,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Throwables;
 import org.apache.flume.*;
 import org.apache.flume.client.avro.ReliableSpoolingFileEventReader;
 import org.apache.flume.conf.Configurable;
+import org.apache.flume.instrumentation.SourceCounter;
 import org.apache.flume.serialization.LineDeserializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -57,18 +60,18 @@ Configurable, EventDrivenSource {
   private Context deserializerContext;
   private String deletePolicy;
   private String inputCharset;
+  private volatile boolean hasFatalError = false;
 
-  private CounterGroup counterGroup;
+  private SourceCounter sourceCounter;
   ReliableSpoolingFileEventReader reader;
+  private ScheduledExecutorService executor;
 
   @Override
-  public void start() {
+  public synchronized void start() {
     logger.info("SpoolDirectorySource source starting with directory: {}",
         spoolDirectory);
 
-    ScheduledExecutorService executor =
-        Executors.newSingleThreadScheduledExecutor();
-    counterGroup = new CounterGroup();
+    executor = Executors.newSingleThreadScheduledExecutor();
 
     File directory = new File(spoolDirectory);
     try {
@@ -89,21 +92,39 @@ Configurable, EventDrivenSource {
           ioe);
     }
 
-    Runnable runner = new SpoolDirectoryRunnable(reader, counterGroup);
+    Runnable runner = new SpoolDirectoryRunnable(reader, sourceCounter);
     executor.scheduleWithFixedDelay(
         runner, 0, POLL_DELAY_MS, TimeUnit.MILLISECONDS);
 
     super.start();
     logger.debug("SpoolDirectorySource source started");
+    sourceCounter.start();
   }
 
   @Override
-  public void stop() {
+  public synchronized void stop() {
+    executor.shutdown();
+    try {
+      executor.awaitTermination(10L, TimeUnit.SECONDS);
+    } catch (InterruptedException ex) {
+      logger.info("Interrupted while awaiting termination", ex);
+    }
+    executor.shutdownNow();
+
     super.stop();
+    sourceCounter.stop();
+    logger.info("SpoolDir source {} stopped. Metrics: {}", getName(),
+      sourceCounter);
   }
 
   @Override
-  public void configure(Context context) {
+  public String toString() {
+    return "Spool Directory source " + getName() +
+        ": { spoolDir: " + spoolDirectory + " }";
+  }
+
+  @Override
+  public synchronized void configure(Context context) {
     spoolDirectory = context.getString(SPOOL_DIRECTORY);
     Preconditions.checkState(spoolDirectory != null,
         "Configuration must specify a spooling directory");
@@ -130,21 +151,28 @@ Configurable, EventDrivenSource {
     // spooling directory source, which did not support deserializers
     Integer bufferMaxLineLength = context.getInteger(BUFFER_MAX_LINE_LENGTH);
     if (bufferMaxLineLength != null && deserializerType != null &&
-        deserializerType.equals(DEFAULT_DESERIALIZER)) {
+        deserializerType.equalsIgnoreCase(DEFAULT_DESERIALIZER)) {
       deserializerContext.put(LineDeserializer.MAXLINE_KEY,
           bufferMaxLineLength.toString());
     }
+    if (sourceCounter == null) {
+      sourceCounter = new SourceCounter(getName());
+    }
+  }
 
+  @VisibleForTesting
+  protected boolean hasFatalError() {
+    return hasFatalError;
   }
 
   private class SpoolDirectoryRunnable implements Runnable {
     private ReliableSpoolingFileEventReader reader;
-    private CounterGroup counterGroup;
+    private SourceCounter sourceCounter;
 
     public SpoolDirectoryRunnable(ReliableSpoolingFileEventReader reader,
-        CounterGroup counterGroup) {
+        SourceCounter sourceCounter) {
       this.reader = reader;
-      this.counterGroup = counterGroup;
+      this.sourceCounter = sourceCounter;
     }
 
     @Override
@@ -155,16 +183,20 @@ Configurable, EventDrivenSource {
           if (events.isEmpty()) {
             break;
           }
-          counterGroup.addAndGet("spooler.events.read", (long) events.size());
+          sourceCounter.addToEventReceivedCount(events.size());
+          sourceCounter.incrementAppendBatchReceivedCount();
 
           getChannelProcessor().processEventBatch(events);
           reader.commit();
+          sourceCounter.addToEventAcceptedCount(events.size());
+          sourceCounter.incrementAppendBatchAcceptedCount();
         }
       } catch (Throwable t) {
-        logger.error("Uncaught exception in Runnable", t);
-        if (t instanceof Error) {
-          throw (Error) t;
-        }
+        logger.error("FATAL: " + SpoolDirectorySource.this.toString() + ": " +
+            "Uncaught exception in SpoolDirectorySource thread. " +
+            "Restart or reconfigure Flume to continue processing.", t);
+        hasFatalError = true;
+        Throwables.propagate(t);
       }
     }
   }

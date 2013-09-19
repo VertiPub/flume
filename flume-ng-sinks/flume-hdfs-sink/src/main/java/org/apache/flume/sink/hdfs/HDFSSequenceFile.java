@@ -32,7 +32,7 @@ import org.apache.hadoop.io.compress.CompressionCodec;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class HDFSSequenceFile implements HDFSWriter {
+public class HDFSSequenceFile extends AbstractHDFSWriter {
 
   private static final Logger logger =
       LoggerFactory.getLogger(HDFSSequenceFile.class);
@@ -41,6 +41,7 @@ public class HDFSSequenceFile implements HDFSWriter {
   private Context serializerContext;
   private SequenceFileSerializer serializer;
   private boolean useRawLocalFileSystem;
+  private FSDataOutputStream outStream = null;
 
   public HDFSSequenceFile() {
     writer = null;
@@ -48,6 +49,8 @@ public class HDFSSequenceFile implements HDFSWriter {
 
   @Override
   public void configure(Context context) {
+    super.configure(context);
+
     // use binary writable serialize by default
     writeFormat = context.getString("hdfs.writeFormat",
       SequenceFileSerializerType.Writable.name());
@@ -72,6 +75,12 @@ public class HDFSSequenceFile implements HDFSWriter {
     Configuration conf = new Configuration();
     Path dstPath = new Path(filePath);
     FileSystem hdfs = dstPath.getFileSystem(conf);
+    open(dstPath, codeC, compType, conf, hdfs);
+  }
+
+  protected void open(Path dstPath, CompressionCodec codeC,
+      CompressionType compType, Configuration conf, FileSystem hdfs)
+          throws IOException {
     if(useRawLocalFileSystem) {
       if(hdfs instanceof LocalFileSystem) {
         hdfs = ((LocalFileSystem)hdfs).getRaw();
@@ -82,14 +91,14 @@ public class HDFSSequenceFile implements HDFSWriter {
     }
     if (conf.getBoolean("hdfs.append.support", false) == true && hdfs.isFile
             (dstPath)) {
-      FSDataOutputStream outStream = hdfs.append(dstPath);
-      writer = SequenceFile.createWriter(conf, outStream, serializer
-        .getKeyClass(),
-        serializer.getValueClass(), compType, codeC);
+      outStream = hdfs.append(dstPath);
     } else {
-      writer = SequenceFile.createWriter(hdfs, conf, dstPath,
-        serializer.getKeyClass(), serializer.getValueClass(), compType, codeC);
+      outStream = hdfs.create(dstPath);
     }
+    writer = SequenceFile.createWriter(conf, outStream,
+        serializer.getKeyClass(), serializer.getValueClass(), compType, codeC);
+
+    registerCurrentStream(outStream, hdfs, dstPath);
   }
 
   @Override
@@ -107,5 +116,8 @@ public class HDFSSequenceFile implements HDFSWriter {
   @Override
   public void close() throws IOException {
     writer.close();
+    closeHDFSOutputStream(outStream);
+
+    unregisterCurrentStream();
   }
 }
