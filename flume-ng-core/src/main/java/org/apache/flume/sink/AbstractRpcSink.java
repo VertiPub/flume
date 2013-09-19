@@ -18,8 +18,11 @@
  */
 package org.apache.flume.sink;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Throwables;
 import com.google.common.collect.Lists;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.flume.Channel;
 import org.apache.flume.ChannelException;
 import org.apache.flume.Context;
@@ -35,7 +38,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Map.Entry;
 import java.util.Properties;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * This sink provides the basic RPC functionality for Flume. This sink takes
@@ -103,6 +112,19 @@ import java.util.Properties;
  * <td>milliseconds (long)</td>
  * <td>20000</td>
  * </tr>
+ * <tr>
+ * <td><tt>compression-type</tt></td>
+ * <td>Select compression type.  Default is "none" and the only compression type available is "deflate"</td>
+ * <td>compression type</td>
+ * <td>none</td>
+ * </tr>
+ * <tr>
+ * <td><tt>compression-level</tt></td>
+ * <td>In the case compression type is "deflate" this value can be between 0-9.  0 being no compression and
+ * 1-9 is compression.  The higher the number the better the compression.  6 is the default.</td>
+ * <td>compression level</td>
+ * <td>6</td>
+ * </tr>
  * </table>
  * <p>
  * <b>Metrics</b>
@@ -126,6 +148,12 @@ public abstract class AbstractRpcSink extends AbstractSink
   private RpcClient client;
   private Properties clientProps;
   private SinkCounter sinkCounter;
+  private int cxnResetInterval;
+  private final int DEFAULT_CXN_RESET_INTERVAL = 0;
+  private final ScheduledExecutorService cxnResetExecutor = Executors
+    .newSingleThreadScheduledExecutor(new ThreadFactoryBuilder()
+      .setNameFormat("Rpc Sink Reset Thread").build());
+  private final Lock resetLock = new ReentrantLock();
 
   @Override
   public void configure(Context context) {
@@ -141,28 +169,19 @@ public abstract class AbstractRpcSink extends AbstractSink
     clientProps.setProperty(RpcClientConfigurationConstants.CONFIG_HOSTS_PREFIX +
         "h1", hostname + ":" + port);
 
-    Integer batchSize = context.getInteger("batch-size");
-    if (batchSize != null) {
-      clientProps.setProperty(RpcClientConfigurationConstants.CONFIG_BATCH_SIZE,
-          String.valueOf(batchSize));
-    }
-
-    Long connectTimeout = context.getLong("connect-timeout");
-    if (connectTimeout != null) {
-      clientProps.setProperty(
-          RpcClientConfigurationConstants.CONFIG_CONNECT_TIMEOUT,
-          String.valueOf(connectTimeout));
-    }
-
-    Long requestTimeout = context.getLong("request-timeout");
-    if (requestTimeout != null) {
-      clientProps.setProperty(
-          RpcClientConfigurationConstants.CONFIG_REQUEST_TIMEOUT,
-          String.valueOf(requestTimeout));
+    for (Entry<String, String> entry: context.getParameters().entrySet()) {
+      clientProps.setProperty(entry.getKey(), entry.getValue());
     }
 
     if (sinkCounter == null) {
       sinkCounter = new SinkCounter(getName());
+    }
+    cxnResetInterval = context.getInteger("reset-connection-interval",
+      DEFAULT_CXN_RESET_INTERVAL);
+    if(cxnResetInterval == DEFAULT_CXN_RESET_INTERVAL) {
+      logger.info("Connection reset is set to " + String.valueOf
+        (DEFAULT_CXN_RESET_INTERVAL) +". Will not reset connection to next " +
+        "hop");
     }
   }
 
@@ -191,6 +210,24 @@ public abstract class AbstractRpcSink extends AbstractSink
         Preconditions.checkNotNull(client, "Rpc Client could not be " +
           "initialized. " + getName() + " could not be started");
         sinkCounter.incrementConnectionCreatedCount();
+        if (cxnResetInterval > 0) {
+          cxnResetExecutor.schedule(new Runnable() {
+            @Override
+            public void run() {
+              resetLock.lock();
+              try {
+                destroyConnection();
+                createConnection();
+              } catch (Throwable throwable) {
+                //Don't rethrow, else this runnable won't get scheduled again.
+                logger.error("Error while trying to expire connection",
+                  throwable);
+              } finally {
+                resetLock.unlock();
+              }
+            }
+          }, cxnResetInterval, TimeUnit.SECONDS);
+        }
       } catch (Exception ex) {
         sinkCounter.incrementConnectionFailedCount();
         if (ex instanceof FlumeException) {
@@ -268,6 +305,15 @@ public abstract class AbstractRpcSink extends AbstractSink
     logger.info("Rpc sink {} stopping...", getName());
 
     destroyConnection();
+    cxnResetExecutor.shutdown();
+    try {
+      if (cxnResetExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+        cxnResetExecutor.shutdownNow();
+      }
+    } catch (Exception ex) {
+      logger.error("Interrupted while waiting for connection reset executor " +
+        "to shut down");
+    }
     sinkCounter.stop();
     super.stop();
 
@@ -286,6 +332,7 @@ public abstract class AbstractRpcSink extends AbstractSink
     Channel channel = getChannel();
     Transaction transaction = channel.getTransaction();
 
+    resetLock.lock();
     try {
       transaction.begin();
 
@@ -335,9 +382,15 @@ public abstract class AbstractRpcSink extends AbstractSink
         throw new EventDeliveryException("Failed to send events", t);
       }
     } finally {
+      resetLock.unlock();
       transaction.close();
     }
 
     return status;
+  }
+
+  @VisibleForTesting
+  RpcClient getUnderlyingClient() {
+    return client;
   }
 }

@@ -19,21 +19,17 @@
 
 package org.apache.flume.channel.file;
 
-import java.io.File;
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
-
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
+import com.google.common.base.Throwables;
 import org.apache.flume.Channel;
 import org.apache.flume.ChannelException;
 import org.apache.flume.Context;
 import org.apache.flume.Event;
+import org.apache.flume.annotations.Disposable;
 import org.apache.flume.annotations.InterfaceAudience;
 import org.apache.flume.annotations.InterfaceStability;
-import org.apache.flume.annotations.Disposable;
 import org.apache.flume.channel.BasicChannelSemantics;
 import org.apache.flume.channel.BasicTransactionSemantics;
 import org.apache.flume.channel.file.Log.Builder;
@@ -44,8 +40,12 @@ import org.apache.flume.instrumentation.ChannelCounter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Preconditions;
-import com.google.common.base.Strings;
+import java.io.File;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 /**
  * <p>
@@ -82,6 +82,7 @@ public class FileChannel extends BasicChannelSemantics {
   private long maxFileSize;
   private long minimumRequiredSpace;
   private File checkpointDir;
+  private File backupCheckpointDir;
   private File[] dataDirs;
   private Log log;
   private volatile boolean open;
@@ -98,6 +99,8 @@ public class FileChannel extends BasicChannelSemantics {
   private KeyProvider encryptionKeyProvider;
   private String encryptionActiveKey;
   private String encryptionCipherProvider;
+  private boolean useDualCheckpoints;
+  private boolean isTest = false;
 
   @Override
   public synchronized void setName(String name) {
@@ -108,60 +111,51 @@ public class FileChannel extends BasicChannelSemantics {
   @Override
   public void configure(Context context) {
 
+    useDualCheckpoints = context.getBoolean(
+        FileChannelConfiguration.USE_DUAL_CHECKPOINTS,
+        FileChannelConfiguration.DEFAULT_USE_DUAL_CHECKPOINTS);
     String homePath = System.getProperty("user.home").replace('\\', '/');
 
     String strCheckpointDir =
         context.getString(FileChannelConfiguration.CHECKPOINT_DIR,
             homePath + "/.flume/file-channel/checkpoint");
 
+    String strBackupCheckpointDir = context.getString
+      (FileChannelConfiguration.BACKUP_CHECKPOINT_DIR, "").trim();
+
     String[] strDataDirs = context.getString(FileChannelConfiguration.DATA_DIRS,
         homePath + "/.flume/file-channel/data").split(",");
 
-    if(checkpointDir == null) {
-      checkpointDir = new File(strCheckpointDir);
-    } else if(!checkpointDir.getAbsolutePath().
-        equals(new File(strCheckpointDir).getAbsolutePath())) {
-      LOG.warn("An attempt was made to change the checkpoint " +
-          "directory after start, this is not supported.");
-    }
-    if(dataDirs == null) {
-      dataDirs = new File[strDataDirs.length];
-      for (int i = 0; i < strDataDirs.length; i++) {
-        dataDirs[i] = new File(strDataDirs[i]);
-      }
-    } else {
-      boolean changed = false;
-      if(dataDirs.length != strDataDirs.length) {
-        changed = true;
-      } else {
-        for (int i = 0; i < strDataDirs.length; i++) {
-          if(!dataDirs[i].getAbsolutePath().
-              equals(new File(strDataDirs[i]).getAbsolutePath())) {
-            changed = true;
-            break;
-          }
-        }
-      }
-      if(changed) {
-        LOG.warn("An attempt was made to change the data " +
-            "directories after start, this is not supported.");
-      }
+    checkpointDir = new File(strCheckpointDir);
+
+    if (useDualCheckpoints) {
+      Preconditions.checkState(!strBackupCheckpointDir.isEmpty(),
+        "Dual checkpointing is enabled, but the backup directory is not set. " +
+          "Please set " + FileChannelConfiguration.BACKUP_CHECKPOINT_DIR + " " +
+          "to enable dual checkpointing");
+      backupCheckpointDir = new File(strBackupCheckpointDir);
+      /*
+       * If the backup directory is the same as the checkpoint directory,
+       * then throw an exception and force the config system to ignore this
+       * channel.
+       */
+      Preconditions.checkState(!backupCheckpointDir.equals(checkpointDir),
+        "Could not configure " + getName() + ". The checkpoint backup " +
+          "directory and the checkpoint directory are " +
+          "configured to be the same.");
     }
 
-    int newCapacity = context.getInteger(FileChannelConfiguration.CAPACITY,
-        FileChannelConfiguration.DEFAULT_CAPACITY);
-    if(newCapacity <= 0 && capacity == 0) {
-      newCapacity = FileChannelConfiguration.DEFAULT_CAPACITY;
-      LOG.warn("Invalid capacity specified, initializing channel to "
-              + "default capacity of {}", newCapacity);
+    dataDirs = new File[strDataDirs.length];
+    for (int i = 0; i < strDataDirs.length; i++) {
+      dataDirs[i] = new File(strDataDirs[i]);
     }
-    if(capacity > 0 && newCapacity != capacity) {
-      LOG.warn("Capacity of this channel cannot be sized on the fly due " +
-          "the requirement we have enough DirectMemory for the queue and " +
-          "downsizing of the queue cannot be guranteed due to the " +
-          "fact there maybe more items on the queue than the new capacity.");
-    } else {
-      capacity = newCapacity;
+
+    capacity = context.getInteger(FileChannelConfiguration.CAPACITY,
+        FileChannelConfiguration.DEFAULT_CAPACITY);
+    if(capacity <= 0) {
+      capacity = FileChannelConfiguration.DEFAULT_CAPACITY;
+      LOG.warn("Invalid capacity specified, initializing channel to "
+              + "default capacity of {}", capacity);
     }
 
     keepAlive =
@@ -180,8 +174,8 @@ public class FileChannel extends BasicChannelSemantics {
     }
 
     Preconditions.checkState(transactionCapacity <= capacity,
-        "File Channel transaction capacity cannot be greater than the " +
-            "capacity of the channel.");
+      "File Channel transaction capacity cannot be greater than the " +
+        "capacity of the channel.");
 
     checkpointInterval =
             context.getLong(FileChannelConfiguration.CHECKPOINT_INTERVAL,
@@ -302,6 +296,8 @@ public class FileChannel extends BasicChannelSemantics {
       builder.setEncryptionKeyProvider(encryptionKeyProvider);
       builder.setEncryptionKeyAlias(encryptionActiveKey);
       builder.setEncryptionCipherProvider(encryptionCipherProvider);
+      builder.setUseDualCheckpoints(useDualCheckpoints);
+      builder.setBackupCheckpointDir(backupCheckpointDir);
       log = builder.build();
       log.replay();
       open = true;
@@ -380,7 +376,12 @@ public class FileChannel extends BasicChannelSemantics {
   void close() {
     if(open) {
       open = false;
-      log.close();
+      try {
+        log.close();
+      } catch (Exception e) {
+        LOG.error("Error while trying to close the log.", e);
+        Throwables.propagate(e);
+      }
       log = null;
       queueRemaining = null;
     }
@@ -391,8 +392,31 @@ public class FileChannel extends BasicChannelSemantics {
     return log.didFastReplay();
   }
 
+
+  @VisibleForTesting
+  boolean didFullReplayDueToBadCheckpointException() {
+    return log.didFullReplayDueToBadCheckpointException();
+  }
+
   public boolean isOpen() {
     return open;
+  }
+
+  /**
+   * Did this channel recover a backup of the checkpoint to restart?
+   * @return true if the channel recovered using a backup.
+   */
+  @VisibleForTesting
+  boolean checkpointBackupRestored() {
+    if(log != null) {
+      return log.backupRestored();
+    }
+    return false;
+  }
+
+  @VisibleForTesting
+  Log getLog() {
+    return log;
   }
 
   /**
@@ -428,6 +452,7 @@ public class FileChannel extends BasicChannelSemantics {
     private String getStateAsString() {
       return String.valueOf(getState());
     }
+
     @Override
     protected void doPut(Event event) throws InterruptedException {
       channelCounter.incrementEventPutAttemptCount();
@@ -456,7 +481,7 @@ public class FileChannel extends BasicChannelSemantics {
         }
         FlumeEventPointer ptr = log.put(transactionID, event);
         Preconditions.checkState(putList.offer(ptr), "putList offer failed "
-             + channelNameDescriptor);
+          + channelNameDescriptor);
         queue.addWithoutCommit(ptr, transactionID);
         success = true;
       } catch (IOException e) {
@@ -488,23 +513,40 @@ public class FileChannel extends BasicChannelSemantics {
             + "log. Try increasing the log write timeout value. " +
             channelNameDescriptor);
       }
+
+      /*
+       * 1. Take an event which is in the queue.
+       * 2. If getting that event does not throw NoopRecordException,
+       *    then return it.
+       * 3. Else try to retrieve the next event from the queue
+       * 4. Repeat 2 and 3 until queue is empty or an event is returned.
+       */
+
       try {
-        FlumeEventPointer ptr = queue.removeHead(transactionID);
-        if(ptr != null) {
-          try {
-            // first add to takeList so that if write to disk
-            // fails rollback actually does it's work
-            Preconditions.checkState(takeList.offer(ptr), "takeList offer failed "
-                 + channelNameDescriptor);
-            log.take(transactionID, ptr); // write take to disk
-            Event event = log.get(ptr);
-            return event;
-          } catch (IOException e) {
-            throw new ChannelException("Take failed due to IO error "
-                    + channelNameDescriptor, e);
+        while (true) {
+          FlumeEventPointer ptr = queue.removeHead(transactionID);
+          if (ptr == null) {
+            return null;
+          } else {
+            try {
+              // first add to takeList so that if write to disk
+              // fails rollback actually does it's work
+              Preconditions.checkState(takeList.offer(ptr),
+                "takeList offer failed "
+                  + channelNameDescriptor);
+              log.take(transactionID, ptr); // write take to disk
+              Event event = log.get(ptr);
+              return event;
+            } catch (IOException e) {
+              throw new ChannelException("Take failed due to IO error "
+                + channelNameDescriptor, e);
+            } catch (NoopRecordException e) {
+              LOG.warn("Corrupt record replaced by File Channel Integrity " +
+                "tool found. Will retrieve next event", e);
+              takeList.remove(ptr);
+            }
           }
         }
-        return null;
       } finally {
         log.unlockShared();
       }

@@ -18,7 +18,10 @@
  */
 package org.apache.flume.api;
 
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.List;
@@ -62,6 +65,52 @@ public class TestNettyAvroRpcClient {
   }
 
   /**
+   * Simple request with compression on the server and client with compression level 6
+   * @throws FlumeException
+   * @throws EventDeliveryException
+   */
+  @Test
+  public void testOKServerSimpleCompressionLevel6() throws FlumeException,
+      EventDeliveryException {
+    RpcTestUtils.handlerSimpleAppendTest(new OKAvroHandler(), true, true, 6);
+  }
+
+  /**
+   * Simple request with compression on the server and client with compression level 0
+   *
+   * Compression level 0 = no compression
+   * @throws FlumeException
+   * @throws EventDeliveryException
+   */
+  @Test
+  public void testOKServerSimpleCompressionLevel0() throws FlumeException,
+      EventDeliveryException {
+    RpcTestUtils.handlerSimpleAppendTest(new OKAvroHandler(), true, true, 0);
+  }
+
+  /**
+   * Simple request with compression on the client only
+   * @throws FlumeException
+   * @throws EventDeliveryException
+   */
+  @Test(expected=org.apache.flume.EventDeliveryException.class)
+  public void testOKServerSimpleCompressionClientOnly() throws FlumeException,
+      EventDeliveryException {
+    RpcTestUtils.handlerSimpleAppendTest(new OKAvroHandler(), false, true, 6);
+  }
+
+  /**
+   * Simple request with compression on the server only
+   * @throws FlumeException
+   * @throws EventDeliveryException
+   */
+  @Test(expected=org.apache.flume.EventDeliveryException.class)
+  public void testOKServerSimpleCompressionServerOnly() throws FlumeException,
+      EventDeliveryException {
+    RpcTestUtils.handlerSimpleAppendTest(new OKAvroHandler(), true, false, 6);
+  }
+
+  /**
    * Simple batch request
    * @throws FlumeException
    * @throws EventDeliveryException
@@ -70,6 +119,50 @@ public class TestNettyAvroRpcClient {
   public void testOKServerBatch() throws FlumeException,
       EventDeliveryException {
     RpcTestUtils.handlerBatchAppendTest(new OKAvroHandler());
+  }
+
+  /**
+   * Simple batch request with compression deflate level 0
+   * @throws FlumeException
+   * @throws EventDeliveryException
+   */
+  @Test
+  public void testOKServerBatchCompressionLevel0() throws FlumeException,
+      EventDeliveryException {
+    RpcTestUtils.handlerBatchAppendTest(new OKAvroHandler(), true, true, 0);
+  }
+
+  /**
+   * Simple batch request with compression deflate level 6
+   * @throws FlumeException
+   * @throws EventDeliveryException
+   */
+  @Test
+  public void testOKServerBatchCompressionLevel6() throws FlumeException,
+      EventDeliveryException {
+    RpcTestUtils.handlerBatchAppendTest(new OKAvroHandler(), true, true, 6);
+  }
+
+  /**
+   * Simple batch request where the server only is using compression
+   * @throws FlumeException
+   * @throws EventDeliveryException
+   */
+  @Test(expected=org.apache.flume.EventDeliveryException.class)
+  public void testOKServerBatchCompressionServerOnly() throws FlumeException,
+      EventDeliveryException {
+    RpcTestUtils.handlerBatchAppendTest(new OKAvroHandler(), true, false, 6);
+  }
+
+  /**
+   * Simple batch request where the client only is using compression
+   * @throws FlumeException
+   * @throws EventDeliveryException
+   */
+  @Test(expected=org.apache.flume.EventDeliveryException.class)
+  public void testOKServerBatchCompressionClientOnly() throws FlumeException,
+      EventDeliveryException {
+    RpcTestUtils.handlerBatchAppendTest(new OKAvroHandler(), false, true, 6);
   }
 
   /**
@@ -239,6 +332,50 @@ public class TestNettyAvroRpcClient {
 
     RpcTestUtils.handlerBatchAppendTest(new ThrowingAvroHandler());
     logger.error("Throwing: I should never have gotten here!");
+  }
+
+  @Test
+  public void spinThreadsCrazily() throws IOException {
+
+    int initThreadCount = ManagementFactory.getThreadMXBean().getThreadCount();
+
+    // find a port we know is closed by opening a free one then closing it
+    ServerSocket sock = new ServerSocket(0);
+    int port = sock.getLocalPort();
+    sock.close();
+
+    Properties props = new Properties();
+    props.put(RpcClientConfigurationConstants.CONFIG_CLIENT_TYPE,
+        RpcClientConfigurationConstants.DEFAULT_CLIENT_TYPE);
+    props.put(RpcClientConfigurationConstants.CONFIG_HOSTS, "h1");
+    props.put(RpcClientConfigurationConstants.CONFIG_HOSTS_PREFIX + "h1",
+        "localhost:" + port);
+    props.put(RpcClientConfigurationConstants.CONFIG_CONNECT_TIMEOUT, "20");
+    props.put(RpcClientConfigurationConstants.CONFIG_REQUEST_TIMEOUT, "20");
+    props.put(RpcClientConfigurationConstants.CONFIG_BATCH_SIZE, "1");
+
+    for (int i = 0; i < 1000; i++) {
+      RpcClient client = null;
+      try {
+        client = RpcClientFactory.getDefaultInstance("localhost", port);
+        client.append(EventBuilder.withBody("Hello", Charset.forName("UTF-8")));
+      } catch (FlumeException e) {
+        logger.warn("Unexpected error", e);
+      } catch (EventDeliveryException e) {
+        logger.warn("Expected error", e);
+      } finally {
+        if (client != null) {
+          client.close();
+        }
+      }
+    }
+
+    int threadCount = ManagementFactory.getThreadMXBean().getThreadCount();
+    logger.warn("Init thread count: {}, thread count: {}",
+        initThreadCount, threadCount);
+    Assert.assertEquals("Thread leak in RPC client",
+        initThreadCount, threadCount);
+
   }
 
 }
