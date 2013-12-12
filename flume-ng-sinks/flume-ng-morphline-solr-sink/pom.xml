@@ -78,6 +78,12 @@ limitations under the License.
       <groupId>org.slf4j</groupId>
       <artifactId>jcl-over-slf4j</artifactId>
       <version>${slf4j.version}</version> <!-- flume provides 1.7.2 and solr depends on 1.6.4 -->
+      <exclusions>
+        <exclusion>
+            <groupId>org.apache.hadoop</groupId>
+           <artifactId>hadoop-common</artifactId>
+        </exclusion>
+      </exclusions>
       <scope>provided</scope>
     </dependency>
 
