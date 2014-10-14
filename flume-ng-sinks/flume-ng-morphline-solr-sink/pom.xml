@@ -41,8 +41,8 @@ limitations under the License.
 
   <repositories>
     <repository>
-      <id>cdh.repo</id>
-      <url>https://repository.cloudera.com/artifactory/cloudera-repos</url>
+      <id>cdh.mirror.repo</id>
+      <url>http://archiva.service.verticloud.com/archiva/repository/internal/</url>
       <name>Cloudera Repositories</name>
       <snapshots>
         <enabled>false</enabled>
